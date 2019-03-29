@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "phpMyAdmin on EC2"
+
+Parameters:
+  DBHost:
+    Type: String
+    MinLength: "1"
+    MaxLength: "256"
+    Description: "MySQL database hostname"
+  DBPort:
+    Type: Number
+    Default: 3306
+    Description: "MySQL database port number"
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+  InstanceType:
+    Description: "WebServer EC2 instance type"
+    Type: String
+    Default: "t3.micro"
+    AllowedValues:
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+  AllowIp:
+    Description: "The IP address range that can be used to WEB to the EC2 instances"
+    Type: String
+
+  RDSSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: "RDS Accesible SecurityGroup."
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: "RDS Provisoned SubnetId."
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "RDS Provisoned VpcId."
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          InstallAndRun:
+            - Install
+            - Configure
+        Install:
+          packages:
+            yum:
+              httpd: []
+              php-mbstring: []
+          files:
+            /etc/phpmyadmin/config-db-extra.php:
+              content:
+                Fn::Join:
+                  - ""
+                  - - "<?php\n"
+                    - "/* Authentication type */\n"
+                    - "$cfg['Servers'][$i]['auth_type'] = 'cookie';\n"
+                    - "/* Server parameters */\n"
+                    - "$cfg['Servers'][$i]['host'] = '"
+                    - !Ref DBHost
+                    - "';\n"
+                    - "$cfg['Servers'][$i]['port'] = '"
+                    - !Ref DBPort
+                    - "';\n"
+                    - "$cfg['Servers'][$i]['connect_type'] = 'tcp';\n"
+                    - "$cfg['Servers'][$i]['compress'] = false;\n"
+                    - "$cfg['Servers'][$i]['hide_db'] = '(mysql|information_schema|performance_schema|innodb)';\n"
+                    - "$i++;\n"
+                    - "?>\n"
+              mode: "00644"
+              owner: root
+              group: apache
+        Configure:
+          commands:
+            01_httpd_restart:
+              command: "systemctl restart httpd"
+            02_php_restart:
+              command: "systemctl restart php-fpm"
+            03_wget_phpmyadmin:
+              command: "wget https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz"
+              cwd: "/var/www/html/"
+            04_unpack:
+              command: "tar -xvzf phpMyAdmin-latest-all-languages.tar.gz -C . --strip-components 1"
+              cwd: "/var/www/html/"
+            05_cleanup:
+              command: "rm phpMyAdmin-latest-all-languages.tar.gz"
+              cwd: "/var/www/html/"
+            06_copy_config:
+              command: "cp /var/www/html/config.sample.inc.php /var/www/html/config.inc.php\n"
+              cwd: "/var/www/html/"
+            07_setup:
+              command: "echo 'require(\"/etc/phpmyadmin/config-db-extra.php\");' >> /var/www/html/config.inc.php\n"
+              cwd: "/var/www/html/"
+            08_setup2:
+              command: "echo '$cfg[\"TempDir\"]=\"/tmp\";' >> /var/www/html/config.inc.php\n"
+              cwd: "/var/www/html/"
+            09_change_owner:
+              command: "chown apache:root -R *\n"
+              cwd: "/var/www/html/"
+    Properties:
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref RDSSecurityGroupId
+        - !Ref WebServerSecurityGroup
+      SubnetId: !Ref SubnetId
+      UserData: !Base64
+        Fn::Join:
+          - ""
+          - - "#!/bin/bash -xe\n"
+            - "yum install -y aws-cfn-bootstrap\n"
+            - "amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2\n"
+            - "# Install the files and packages from the metadata\n"
+            - " /opt/aws/bin/cfn-init -v "
+            - " --stack "
+            - !Ref AWS::StackName
+            - " --resource WebServerInstance "
+            - " --configsets InstallAndRun "
+            - " --region "
+            - !Ref AWS::Region
+            - "\n"
+            - "# Signal the status from cfn-init\n"
+            - "/opt/aws/bin/cfn-signal -e $? "
+            - " --stack "
+            - !Ref AWS::StackName
+            - " --resource WebServerInstance "
+            - " --region "
+            - !Ref AWS::Region
+            - "\n"
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: "PT5M"
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: "Enable HTTP access via port 80"
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowIp
+
+Outputs:
+  WebsiteURL:
+    Description: "URL for newly created phpMyAdmin"
+    Value:
+      Fn::Join:
+        - ""
+        - - "http://"
+          - !GetAtt  [WebServerInstance, PublicDnsName]
